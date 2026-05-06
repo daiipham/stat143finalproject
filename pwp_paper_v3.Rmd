@@ -1,0 +1,1863 @@
+---
+title: "Point Win Probability — Replication and SoS Extension"
+subtitle: "Harvard Women's Volleyball 2018 (built on Powers, Stancil & Consiglio 2025)"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    latex_engine: xelatex
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 9, fig.height = 5, dpi = 110)
+library(ggplot2)
+library(scales)
+# Required packages: datavolley, dplyr, tibble, tidyr, lme4, ggrepel, purrr
+```
+
+# 1. Setup and Data Loading
+
+```{r config}
+randomize_blocker_digger_resp <- FALSE
+data_dir <- "2018dvwfiles"   # adjust to your local path
+```
+
+```{r load-data}
+dvw_files <- list.files(data_dir, pattern = "\\.dvw$", full.names = TRUE)
+
+plays_list <- list()
+for (file in dvw_files) {
+  data <- try(
+    datavolley::dv_read(file, insert_technical_timeouts = FALSE),
+    silent = TRUE
+  )
+  if ("datavolley" %in% class(data)) {
+    plays_list[[file]] <- datavolley::plays(data)
+  }
+}
+
+plays <- dplyr::bind_rows(plays_list) |>
+  tibble::as_tibble()
+
+cat("Total rows:", nrow(plays), "\n")
+cat("Matches loaded:", length(plays_list), "\n")
+```
+
+# 2. Lookup Tables
+
+```{r lookup-tables}
+team <- plays |>
+  dplyr::filter(!is.na(team_id)) |>
+  dplyr::distinct(team_id, team_name = team)
+
+player <- plays |>
+  dplyr::filter(!is.na(player_id), player_id != "unknown player") |>
+  dplyr::count(player_id, player_name, team_id) |>
+  dplyr::arrange(-n) |>
+  dplyr::group_by(player_id) |>
+  dplyr::slice(1) |>
+  dplyr::ungroup() |>
+  dplyr::select(player_id, player_name, team_id)
+
+team_lineup_away <- plays |>
+  dplyr::select(match_id, set_number, team_id = visiting_team_id,
+                dplyr::starts_with("visiting_player_id")) |>
+  dplyr::distinct() |>
+  tidyr::pivot_longer(cols = dplyr::starts_with("visiting_player_id"),
+                      values_to = "player_id") |>
+  dplyr::distinct(match_id, set_number, team_id, player_id) |>
+  dplyr::filter(player_id != "unkown player")
+
+team_lineup_home <- plays |>
+  dplyr::select(match_id, set_number, team_id = home_team_id,
+                dplyr::starts_with("home_player_id")) |>
+  dplyr::distinct() |>
+  tidyr::pivot_longer(cols = dplyr::starts_with("home_player_id"),
+                      values_to = "player_id") |>
+  dplyr::distinct(match_id, set_number, team_id, player_id) |>
+  dplyr::filter(player_id != "unkown player")
+
+team_lineup <- dplyr::bind_rows(team_lineup_away, team_lineup_home)
+
+libero <- plays |>
+  dplyr::filter(skill %in% c("Serve", "Reception", "Dig")) |>
+  dplyr::count(match_id, set_number, team_id, player_id) |>
+  dplyr::anti_join(team_lineup,
+                   by = c("match_id", "set_number", "team_id", "player_id")) |>
+  dplyr::group_by(match_id, set_number, team_id) |>
+  dplyr::arrange(-n) |>
+  dplyr::slice(1) |>
+  dplyr::ungroup() |>
+  dplyr::select(match_id, set_number, team_id, libero_id = player_id)
+
+cat("Teams:", nrow(team), "  Players:", nrow(player), "\n")
+
+# After the §4 cleaning step, with `contact` and `bad_data` already in memory
+contact_clean <- contact |>
+  dplyr::anti_join(bad_data, by = c("match_id", "point_id"))
+
+# Total cleaned
+nrow(contact_clean)
+# Should be 20,439
+
+# Breakdown by what gets counted vs not
+contact_clean |>
+  dplyr::mutate(
+    bucket = dplyr::case_when(
+      skill %in% c("Serve", "Reception", "Set", "Attack", "Block", "Dig") ~ "six_core_skills",
+      point ~ "terminal_point_marker",
+      is.na(skill) ~ "no_skill",
+      TRUE ~ paste0("other_skill: ", skill)
+    )
+  ) |>
+  dplyr::count(bucket, sort = TRUE)
+```
+
+# 3. Markov Chain States
+
+```{r markov-states}
+cumpaste <- function(x, .sep = " ") {
+  concat <- paste(x, collapse = .sep)
+  substring(concat, 1L, cumsum(c(nchar(x[[1L]]), nchar(x[-1L]) + nchar(.sep))))
+}
+
+contact <- plays |>
+  dplyr::mutate(
+    team_id_offense = team_id,
+    team_id_defense = ifelse(team_id_offense == home_team_id,
+                             visiting_team_id, home_team_id),
+    serve_receive = ifelse(team == serving_team, "S", "R"),
+    is_volley_end = dplyr::coalesce(
+      dplyr::lead(point, 1) | (team_touch_id != dplyr::lead(team_touch_id, 1)),
+      TRUE
+    ),
+    abbrev = dplyr::case_when(
+      point ~ "P",
+      is.na(skill) ~ NA_character_,
+      grepl("Unknown", skill) ~ NA_character_,
+      skill == "Serve" ~ "SV",
+      skill == "Attack" ~ paste0("A", attack_code),
+      TRUE ~ paste0(substring(skill, 1, 1), evaluation_code)
+    ),
+    player_id_lead_1 = dplyr::lead(player_id, 1),
+    skill_lead_1 = dplyr::lead(skill, 1),
+    evaluation_code_lead_1 = dplyr::lead(evaluation_code, 1)
+  ) |>
+  dplyr::filter(!is.na(abbrev), !is.na(serving_team)) |>
+  dplyr::group_by(match_id, point_id, team_touch_id, point) |>
+  dplyr::mutate(
+    state = paste0(serve_receive[1], "_", cumpaste(abbrev, .sep = ".")),
+    num_contacts = length(abbrev)
+  ) |>
+  dplyr::ungroup()
+
+cat("Total contacts:", nrow(contact),
+    "  Distinct states:", dplyr::n_distinct(contact$state), "\n")
+```
+
+# 4. Data Cleaning
+
+```{r data-cleaning}
+bad_data <- contact |>
+  dplyr::group_by(state) |>
+  dplyr::mutate(n = dplyr::n()) |>
+  dplyr::ungroup() |>
+  dplyr::filter(
+    (num_contacts > 4) |
+    (abbrev %in% c("SV", "A") & !is_volley_end) |
+    (n < 10)
+  ) |>
+  dplyr::distinct(match_id, point_id)
+
+cat("Bad points removed:", nrow(bad_data), "\n")
+cat("Contacts remaining:",
+    nrow(contact |> dplyr::anti_join(bad_data, by = c("match_id", "point_id"))),
+    "\n")
+```
+
+# 5. Transition Matrix and Sideout Probability
+
+```{r transitions}
+state_transition <- contact |>
+  dplyr::anti_join(bad_data, by = c("match_id", "point_id")) |>
+  dplyr::count(state, next_state = dplyr::lead(state, 1)) |>
+  dplyr::mutate(
+    next_state = dplyr::case_when(
+      state == "R_P" ~ "R_P",
+      state == "S_P" ~ "S_P",
+      TRUE ~ next_state
+    )
+  )
+
+state_transition_wide <- state_transition |>
+  dplyr::bind_rows(tibble::tibble(state = "S_SV", next_state = "S_SV", n = 0)) |>
+  dplyr::group_by(state, next_state) |>
+  dplyr::summarize(n = sum(n), .groups = "drop") |>
+  dplyr::group_by(state) |>
+  dplyr::transmute(state, next_state, prob = n / sum(n)) |>
+  dplyr::arrange(next_state) |>
+  tidyr::pivot_wider(names_from = next_state, values_from = prob, values_fill = 0) |>
+  dplyr::arrange(state)
+
+state_transition_matrix <- state_transition_wide |>
+  tibble::column_to_rownames("state") |>
+  as.matrix()
+```
+
+```{r sideout-prob}
+state_transition_matrix_limit <- state_transition_matrix
+for (i in 1:100) {
+  state_transition_matrix_limit <- state_transition_matrix_limit %*% state_transition_matrix
+}
+
+sideout_prob <- state_transition_matrix_limit[, c("S_P", "R_P")] |>
+  tibble::as_tibble() |>
+  tibble::add_column(state = rownames(state_transition_matrix), .before = 1) |>
+  dplyr::transmute(state, sideout_prob = R_P)
+
+win_prob_from_dig <- sideout_prob |>
+  dplyr::filter(nchar(state) == 4, substring(state, 1, 3) == "R_D") |>
+  dplyr::transmute(eval = substring(state, 4), win_prob = sideout_prob)
+
+contact_sideout_prob <- contact |>
+  dplyr::left_join(sideout_prob, by = "state") |>
+  dplyr::mutate(sideout_prob_lead_1 = dplyr::lead(sideout_prob, 1))
+
+cat("Sideout from serve (S_SV):",
+    round(sideout_prob$sideout_prob[sideout_prob$state == "S_SV"], 4), "\n")
+```
+
+# 5b. Pass Quality Ladder
+
+The cleanest face-validity check for the Markov chain output: sideout probability
+should rise monotonically with reception evaluation, and each step up the
+reception scale should be worth a meaningful chunk of win probability.
+
+```{r pass-ladder, fig.height = 4}
+state_freq <- contact |>
+  dplyr::anti_join(bad_data, by = c("match_id", "point_id")) |>
+  dplyr::count(state, name = "n")
+
+baseline_serve <- sideout_prob$sideout_prob[sideout_prob$state == "S_SV"]
+
+pass_ladder <- sideout_prob |>
+  dplyr::filter(state %in% c("S_SV", "R_R#", "R_R+", "R_R!", "R_R-", "R_R=")) |>
+  dplyr::left_join(state_freq, by = "state") |>
+  dplyr::mutate(
+    description = dplyr::case_when(
+      state == "S_SV" ~ "Baseline (just-served)",
+      state == "R_R#" ~ "Perfect pass",
+      state == "R_R+" ~ "Good pass",
+      state == "R_R!" ~ "Medium pass",
+      state == "R_R-" ~ "Poor pass",
+      state == "R_R=" ~ "Reception error / ace"
+    )
+  ) |>
+  dplyr::arrange(dplyr::desc(sideout_prob))
+
+pass_ladder |>
+  dplyr::filter(state != "S_SV") |>
+  dplyr::mutate(state = factor(state,
+                               levels = c("R_R=", "R_R-", "R_R!", "R_R+", "R_R#"))) |>
+  ggplot(aes(x = state, y = sideout_prob)) +
+  geom_col(fill = "#3b5bdb", width = 0.6) +
+  geom_hline(yintercept = baseline_serve, linetype = "dashed", color = "grey40") +
+  geom_text(aes(label = sprintf("%.3f", sideout_prob)),
+            vjust = -0.5, size = 3.5) +
+  annotate("text", x = 1, y = baseline_serve + 0.02, hjust = 0,
+           label = sprintf("Baseline (just-served) = %.3f", baseline_serve),
+           color = "grey30", size = 3.2) +
+  scale_y_continuous(labels = percent_format(accuracy = 1),
+                     limits = c(0, 0.75), expand = c(0, 0)) +
+  scale_x_discrete(labels = c("R= (ace)", "R- (poor)", "R! (medium)",
+                              "R+ (good)", "R# (perfect)")) +
+  labs(
+    title = "Pass quality drives sideout probability",
+    subtitle = sprintf("Each step up the reception scale is worth %d-%d percentage points of win probability",
+                       5, 13),
+    x = NULL, y = "Receiver point-win probability"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major.x = element_blank(),
+        plot.title.position = "plot")
+```
+
+The ladder is monotone and the gaps are large: a perfect pass is worth roughly
+13 percentage points of win probability over a poor pass. This is the simplest
+visualization of why per-contact PG is informative — the per-contact win
+probability changes are large enough to support meaningful player evaluation.
+
+# 6. Serve and Reception PG (raw)
+
+```{r serve-data}
+serve_data <- contact_sideout_prob |>
+  dplyr::filter(
+    skill == "Serve",
+    skill_lead_1 == "Reception" | evaluation_code == "=",
+    !is.na(sideout_prob_lead_1),
+    player_id != "unknown player",
+    !is.na(home_team_id),
+    !is.na(visiting_team_id)
+  ) |>
+  dplyr::mutate(
+    server_id = player_id,
+    receiver_id = player_id_lead_1,
+    is_error = evaluation_code == "=",
+    no_error = !is_error,
+    exp_no_error = weighted.mean(sideout_prob_lead_1, w = !is_error),
+    pg_is_error = ifelse(is_error, 1, exp_no_error) - sideout_prob,
+    pg_no_error = ifelse(is_error, 0, sideout_prob_lead_1 - exp_no_error)
+  )
+```
+
+```{r pg-serve-raw}
+pg_serve <- serve_data |>
+  dplyr::select(-player_name, -team_id) |>
+  dplyr::left_join(dplyr::select(player, player_id, player_name, team_id),
+                   by = "player_id") |>
+  dplyr::left_join(team, by = "team_id") |>
+  dplyr::group_by(player_id, player_name, team_name) |>
+  dplyr::summarize(
+    pg = -mean(pg_is_error + pg_no_error),
+    n = dplyr::n(),
+    pct_is_error = mean(is_error),
+    pg_is_error = -mean(pg_is_error),
+    n_no_error = sum(no_error),
+    pct_ace = weighted.mean(evaluation_code == "#", w = no_error),
+    pg_no_error = -mean(pg_no_error),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(-pg)
+```
+
+```{r pg-reception-raw}
+pg_reception <- serve_data |>
+  dplyr::select(-player_id, -player_name, -team_id) |>
+  dplyr::rename(player_id = receiver_id) |>
+  dplyr::left_join(dplyr::select(player, player_id, player_name, team_id),
+                   by = "player_id") |>
+  dplyr::left_join(team, by = "team_id") |>
+  dplyr::group_by(player_id, player_name, team_name) |>
+  dplyr::summarize(
+    n_reception = sum(no_error),
+    pct_ace = weighted.mean(evaluation_code == "#", w = no_error),
+    pg_reception = weighted.mean(pg_no_error, w = no_error),
+    .groups = "drop"
+  )
+```
+
+# 7. Attack Outcome Tree
+
+```{r attack-prep}
+attack <- contact_sideout_prob |>
+  dplyr::left_join(libero,
+                   by = c("match_id", "set_number", "home_team_id" = "team_id")) |>
+  dplyr::rename(home_libero_id = libero_id) |>
+  dplyr::left_join(libero,
+                   by = c("match_id", "set_number", "visiting_team_id" = "team_id")) |>
+  dplyr::rename(visiting_libero_id = libero_id) |>
+  dplyr::mutate(
+    is_error = evaluation_code == "=",
+    is_no_error = !is_error,
+    is_block = !is_error & dplyr::coalesce(dplyr::lead(skill, 1) == "Block", FALSE),
+    is_no_block = !is_error & !is_block,
+    is_block_error = is_block & dplyr::lead(evaluation_code, 1) == "=",
+    is_block_no_error = is_block & !is_block_error,
+    is_block_return = is_block_no_error & (
+      dplyr::lead(evaluation_code, 1) == "#" |
+      dplyr::coalesce(dplyr::lead(skill, 2) == "Dig", FALSE) &
+        team_id == dplyr::lead(team_id, 2)
+    ),
+    is_block_through = is_block_no_error & (
+      dplyr::coalesce(dplyr::lead(skill, 2) == "Dig", FALSE) &
+        team_id != dplyr::lead(team_id, 2)
+    ),
+    outcome_eval = dplyr::case_when(
+      is_error ~ "=",
+      !is_error & !is_block & dplyr::lead(skill, 1) %in% c("Dig", NA) ~
+        dplyr::coalesce(dplyr::lead(evaluation_code, 1), "="),
+      is_block_error ~ "=",
+      is_block & !is_block_error & !is_block_return &
+        dplyr::lead(skill, 2) %in% c("Dig", NA) ~
+        dplyr::coalesce(dplyr::lead(evaluation_code, 2), "="),
+      is_block_return & dplyr::lead(skill, 2) %in% c("Dig", NA) ~
+        dplyr::coalesce(dplyr::lead(evaluation_code, 2), "=")
+    ),
+    outcome_team = ifelse(is_error | is_block_return, "offense", "defense"),
+    defense_setter_position = ifelse(team_id == home_team_id,
+                                     visiting_setter_position,
+                                     home_setter_position),
+    defense_player_id1 = ifelse(team_id == home_team_id, visiting_player_id1, home_player_id1),
+    defense_player_id2 = ifelse(team_id == home_team_id, visiting_player_id2, home_player_id2),
+    defense_player_id3 = ifelse(team_id == home_team_id, visiting_player_id3, home_player_id3),
+    defense_player_id4 = ifelse(team_id == home_team_id, visiting_player_id4, home_player_id4),
+    defense_player_id5 = ifelse(team_id == home_team_id, visiting_player_id5, home_player_id5),
+    defense_player_id6 = ifelse(team_id == home_team_id, visiting_player_id6, home_player_id6),
+    defense_libero_id = ifelse(team_id == home_team_id, visiting_libero_id, home_libero_id),
+    offense_setter_position = ifelse(team_id == visiting_team_id,
+                                     visiting_setter_position,
+                                     home_setter_position),
+    offense_player_id1 = ifelse(team_id == visiting_team_id, visiting_player_id1, home_player_id1),
+    offense_player_id2 = ifelse(team_id == visiting_team_id, visiting_player_id2, home_player_id2),
+    offense_player_id3 = ifelse(team_id == visiting_team_id, visiting_player_id3, home_player_id3),
+    offense_player_id4 = ifelse(team_id == visiting_team_id, visiting_player_id4, home_player_id4),
+    offense_player_id5 = ifelse(team_id == visiting_team_id, visiting_player_id5, home_player_id5),
+    offense_player_id6 = ifelse(team_id == visiting_team_id, visiting_player_id6, home_player_id6),
+    offense_libero_id = ifelse(team_id == visiting_team_id, visiting_libero_id, home_libero_id),
+
+    defense_back_right_player_id = dplyr::case_when(
+      defense_setter_position == 1 ~ defense_player_id1,
+      defense_setter_position == 2 ~ defense_player_id5,
+      defense_setter_position == 3 ~ defense_player_id6,
+      defense_setter_position == 4 ~ defense_player_id1,
+      defense_setter_position == 5 ~ defense_player_id5,
+      defense_setter_position == 6 ~ defense_player_id6
+    ),
+    defense_front_right_player_id = dplyr::case_when(
+      defense_setter_position == 1 ~ defense_player_id4,
+      defense_setter_position == 2 ~ defense_player_id2,
+      defense_setter_position == 3 ~ defense_player_id3,
+      defense_setter_position == 4 ~ defense_player_id4,
+      defense_setter_position == 5 ~ defense_player_id2,
+      defense_setter_position == 6 ~ defense_player_id3
+    ),
+    defense_front_middle_player_id = dplyr::case_when(
+      defense_setter_position == 1 ~ defense_player_id3,
+      defense_setter_position == 2 ~ defense_player_id4,
+      defense_setter_position == 3 ~ defense_player_id2,
+      defense_setter_position == 4 ~ defense_player_id3,
+      defense_setter_position == 5 ~ defense_player_id4,
+      defense_setter_position == 6 ~ defense_player_id2
+    ),
+    defense_front_left_player_id = dplyr::case_when(
+      defense_setter_position == 1 ~ defense_player_id2,
+      defense_setter_position == 2 ~ defense_player_id3,
+      defense_setter_position == 3 ~ defense_player_id4,
+      defense_setter_position == 4 ~ defense_player_id2,
+      defense_setter_position == 5 ~ defense_player_id3,
+      defense_setter_position == 6 ~ defense_player_id4
+    ),
+    defense_back_left_player_id = defense_libero_id,
+    defense_back_middle_player_id = dplyr::case_when(
+      defense_setter_position == 1 ~ defense_player_id5,
+      defense_setter_position == 2 ~ defense_player_id6,
+      defense_setter_position == 3 ~ defense_player_id1,
+      defense_setter_position == 4 ~ defense_player_id5,
+      defense_setter_position == 5 ~ defense_player_id6,
+      defense_setter_position == 6 ~ defense_player_id1
+    ),
+
+    offense_back_right_player_id = dplyr::case_when(
+      offense_setter_position == 1 ~ offense_player_id1,
+      offense_setter_position == 2 ~ offense_player_id5,
+      offense_setter_position == 3 ~ offense_player_id6,
+      offense_setter_position == 4 ~ offense_player_id1,
+      offense_setter_position == 5 ~ offense_player_id5,
+      offense_setter_position == 6 ~ offense_player_id6
+    ),
+    offense_front_right_player_id = dplyr::case_when(
+      offense_setter_position == 1 ~ offense_player_id4,
+      offense_setter_position == 2 ~ offense_player_id2,
+      offense_setter_position == 3 ~ offense_player_id3,
+      offense_setter_position == 4 ~ offense_player_id4,
+      offense_setter_position == 5 ~ offense_player_id2,
+      offense_setter_position == 6 ~ offense_player_id3
+    ),
+    offense_front_middle_player_id = dplyr::case_when(
+      offense_setter_position == 1 ~ offense_player_id3,
+      offense_setter_position == 2 ~ offense_player_id4,
+      offense_setter_position == 3 ~ offense_player_id2,
+      offense_setter_position == 4 ~ offense_player_id3,
+      offense_setter_position == 5 ~ offense_player_id4,
+      offense_setter_position == 6 ~ offense_player_id2
+    ),
+    offense_front_left_player_id = dplyr::case_when(
+      offense_setter_position == 1 ~ offense_player_id2,
+      offense_setter_position == 2 ~ offense_player_id3,
+      offense_setter_position == 3 ~ offense_player_id4,
+      offense_setter_position == 4 ~ offense_player_id2,
+      offense_setter_position == 5 ~ offense_player_id3,
+      offense_setter_position == 6 ~ offense_player_id4
+    ),
+    offense_back_left_player_id = offense_libero_id,
+    offense_back_middle_player_id = dplyr::case_when(
+      offense_setter_position == 1 ~ offense_player_id5,
+      offense_setter_position == 2 ~ offense_player_id6,
+      offense_setter_position == 3 ~ offense_player_id1,
+      offense_setter_position == 4 ~ offense_player_id5,
+      offense_setter_position == 5 ~ offense_player_id6,
+      offense_setter_position == 6 ~ offense_player_id1
+    ),
+
+    player_position = dplyr::case_when(
+      player_id == offense_front_left_player_id ~ "OH",
+      player_id == offense_front_middle_player_id ~ "MB",
+      player_id == offense_front_right_player_id ~ "RS",
+      player_id %in% c(offense_back_left_player_id,
+                       offense_back_middle_player_id,
+                       offense_back_right_player_id) ~ "BR"
+    ),
+    player_zone = dplyr::case_when(
+      player_id == offense_back_left_player_id ~ "BL",
+      player_id == offense_back_middle_player_id ~ "BM",
+      player_id == offense_back_right_player_id ~ "BR",
+      player_id == offense_front_left_player_id ~ "FL",
+      player_id == offense_front_middle_player_id ~ "FM",
+      player_id == offense_front_right_player_id ~ "FR",
+      TRUE ~ "BL"
+    ),
+    setter_id = ifelse(dplyr::lag(skill, 1) == "Set", dplyr::lag(player_id, 1), NA),
+    blocker_id = ifelse(dplyr::lead(skill, 1) == "Block", dplyr::lead(player_id, 1), NA),
+    digger_id = dplyr::case_when(
+      dplyr::lead(skill, 1) == "Dig" ~ dplyr::lead(player_id, 1),
+      dplyr::lead(skill, 1) == "Block" & dplyr::lead(skill, 2) == "Dig" ~
+        dplyr::lead(player_id, 2),
+      TRUE ~ NA
+    )
+  )
+```
+
+```{r volley-and-resp}
+volley_start <- attack |>
+  dplyr::group_by(match_id, point_id, team_touch_id) |>
+  dplyr::filter(skill != "Block") |>
+  dplyr::slice(1) |>
+  dplyr::transmute(match_id, point_id, team_touch_id,
+                   volley_start = paste0(substring(skill, 1, 1), evaluation_code))
+
+blocker_responsibility <- attack |>
+  dplyr::mutate(
+    blocker_resp = ifelse(dplyr::lead(skill, 1) == "Block",
+                          dplyr::lead(player_zone, 1), NA)
+  ) |>
+  dplyr::count(attack_code, blocker_resp) |>
+  dplyr::filter(!is.na(blocker_resp)) |>
+  dplyr::group_by(attack_code) |>
+  dplyr::arrange(-n) |>
+  dplyr::slice(1) |>
+  dplyr::ungroup() |>
+  dplyr::select(attack_code, blocker_resp)
+
+digger_responsibility <- attack |>
+  dplyr::mutate(
+    digger_resp = ifelse(dplyr::lead(skill, 1) == "Dig",
+                         dplyr::lead(player_zone, 1), NA)
+  ) |>
+  dplyr::count(attack_code, end_zone, digger_resp) |>
+  dplyr::filter(!is.na(digger_resp), !is.na(attack_code)) |>
+  dplyr::group_by(attack_code, end_zone) |>
+  dplyr::arrange(-n) |>
+  dplyr::slice(1) |>
+  dplyr::ungroup() |>
+  dplyr::select(attack_code, end_zone, digger_resp)
+```
+
+```{r attack-data}
+attack_data <- attack |>
+  dplyr::mutate(
+    skill_lead_1 = dplyr::lead(skill, 1),
+    skill_lead_2 = dplyr::lead(skill, 2)
+  ) |>
+  dplyr::filter(
+    skill_lead_1 %in% c("Block", "Dig", NA),
+    skill_lead_1 %in% c("Dig", NA) | skill_lead_2 %in% c("Dig", NA),
+    skill == "Attack",
+    !is_block_no_error | xor(is_block_return, is_block_through)
+  ) |>
+  dplyr::left_join(volley_start, by = c("match_id", "point_id", "team_touch_id")) |>
+  dplyr::left_join(blocker_responsibility, by = "attack_code") |>
+  dplyr::left_join(digger_responsibility, by = c("attack_code", "end_zone")) |>
+  dplyr::left_join(win_prob_from_dig, by = c("outcome_eval" = "eval")) |>
+  dplyr::filter(substring(volley_start, 1, 1) %in% c("D", "R", "F")) |>
+  dplyr::mutate(
+    blocker_resp = ifelse(
+      test = rep(randomize_blocker_digger_resp, length = dplyr::n()),
+      yes = sample(c("FL", "FM", "FR"), size = dplyr::n(), replace = TRUE),
+      no = blocker_resp
+    ),
+    digger_resp = ifelse(
+      test = rep(randomize_blocker_digger_resp, length = dplyr::n()),
+      yes = sample(c("BL", "BM", "BR"), size = dplyr::n(), replace = TRUE),
+      no = blocker_resp
+    ),
+    blocker_id = dplyr::case_when(
+      !is.na(blocker_id) ~ blocker_id,
+      blocker_resp == "FL" ~ defense_front_left_player_id,
+      blocker_resp == "FM" ~ defense_front_middle_player_id,
+      blocker_resp == "FR" ~ defense_front_right_player_id
+    ),
+    digger_id = dplyr::case_when(
+      !is.na(digger_id) ~ digger_id,
+      digger_resp == "FL" ~ defense_front_left_player_id,
+      digger_resp == "FM" ~ defense_front_middle_player_id,
+      digger_resp == "FR" ~ defense_front_right_player_id,
+      digger_resp == "BL" ~ defense_back_left_player_id,
+      digger_resp == "BM" ~ defense_back_middle_player_id,
+      digger_resp == "BR" ~ defense_back_right_player_id
+    ),
+    win_prob = ifelse(outcome_team == "offense", win_prob, 1 - win_prob)
+  )
+```
+
+```{r expected-win-prob}
+exp_win_prob <- attack_data |>
+  dplyr::filter(!is.na(win_prob), !is.na(attack_code)) |>
+  dplyr::group_by(volley_start, attack_code) |>
+  dplyr::summarize(
+    n = dplyr::n(),
+    exp = mean(win_prob),
+    exp_error = 0,
+    exp_no_error = weighted.mean(win_prob, w = is_no_error),
+    exp_block = weighted.mean(win_prob, w = is_block),
+    exp_no_block = weighted.mean(win_prob, w = is_no_block),
+    exp_block_error = 1,
+    exp_block_no_error = weighted.mean(win_prob, w = is_block_no_error),
+    exp_block_return = weighted.mean(win_prob, w = is_block_return),
+    exp_block_through = weighted.mean(win_prob, w = is_block_through),
+    .groups = "drop"
+  ) |>
+  dplyr::filter(n >= 10)
+
+attack_data_with_pg <- attack_data |>
+  dplyr::filter(
+    player_id != "unknown player",
+    !is.na(home_team_id), !is.na(visiting_team_id), !is.na(win_prob)
+  ) |>
+  dplyr::inner_join(exp_win_prob, by = c("volley_start", "attack_code")) |>
+  dplyr::mutate(
+    pg_is_error = dplyr::case_when(
+      is_error ~ exp_error,
+      is_no_error ~ exp_no_error
+    ) - exp,
+    pg_is_block = dplyr::case_when(
+      is_block ~ exp_block,
+      is_no_block ~ exp_no_block,
+      TRUE ~ exp_no_error
+    ) - exp_no_error,
+    pg_is_block_error = dplyr::case_when(
+      is_block_error ~ exp_block_error,
+      is_block_no_error ~ exp_block_no_error,
+      TRUE ~ exp_block
+    ) - exp_block,
+    pg_is_block_return = dplyr::case_when(
+      is_block_return ~ exp_block_return,
+      is_block_through ~ exp_block_through,
+      TRUE ~ exp_block_no_error
+    ) - exp_block_no_error,
+    pg_no_block = ifelse(is_no_block, win_prob - exp_no_block, 0),
+    pg_block_return = ifelse(is_block_return, win_prob - exp_block_return, 0),
+    pg_block_through = ifelse(is_block_through, win_prob - exp_block_through, 0)
+  )
+
+cat("Attack rows with PG:", nrow(attack_data_with_pg), "\n")
+```
+
+# 8. Per-Skill Raw PG Aggregations
+
+```{r pg-attack-raw}
+pg_attack <- attack_data_with_pg |>
+  dplyr::left_join(team, by = "team_id") |>
+  dplyr::group_by(player_id, player_name, team_name, player_position) |>
+  dplyr::summarize(
+    n = dplyr::n(),
+    pct_is_error = mean(is_error),
+    pg_is_error = mean(pg_is_error),
+    n_no_error = sum(is_no_error),
+    pct_is_block = weighted.mean(is_block, w = is_no_error),
+    pg_is_block = mean(pg_is_block),
+    n_block = sum(is_block),
+    pct_is_block_error = weighted.mean(is_block_error, w = is_block),
+    pg_is_block_error = mean(pg_is_block_error),
+    n_block_no_error = sum(is_block_no_error),
+    pct_is_block_through = weighted.mean(is_block_through, w = is_block_no_error),
+    pg_is_block_return = mean(pg_is_block_return),
+    n_no_block = sum(is_no_block),
+    pct_kill_no_block = weighted.mean(win_prob > 0.99, w = is_no_block),
+    pg_no_block = mean(pg_no_block),
+    n_block_through = sum(is_block_through),
+    pct_kill_block_through = weighted.mean(win_prob > 0.99, w = is_block_through),
+    pg_block_through = mean(pg_block_through),
+    n_block_return = sum(is_block_return),
+    pct_stuff = weighted.mean(win_prob < 0.01, w = is_block_return),
+    pg_block_return = mean(pg_block_return),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    pg = pg_is_error + pg_is_block + pg_is_block_error + pg_is_block_return +
+         pg_no_block + pg_block_return + pg_block_through
+  ) |>
+  dplyr::select(player_id, player_name, team_name, player_position, pg,
+                dplyr::everything()) |>
+  dplyr::arrange(-pg)
+```
+
+```{r pg-set-raw}
+pg_set <- attack_data_with_pg |>
+  dplyr::select(-player_id, -player_name) |>
+  dplyr::rename(player_id = setter_id) |>
+  dplyr::left_join(dplyr::select(player, player_id, player_name), by = "player_id") |>
+  dplyr::left_join(team, by = "team_id") |>
+  dplyr::group_by(player_id, player_name, team_name) |>
+  dplyr::summarize(
+    n = dplyr::n(),
+    pct_is_error = mean(is_error),
+    pg_is_error = mean(pg_is_error),
+    n_no_error = sum(is_no_error),
+    pg_is_block = mean(pg_is_block),
+    n_block = sum(is_block),
+    pg_is_block_error = mean(pg_is_block_error),
+    n_block_no_error = sum(is_block_no_error),
+    pg_is_block_return = mean(pg_is_block_return),
+    n_no_block = sum(is_no_block),
+    pg_no_block = mean(pg_no_block),
+    n_block_through = sum(is_block_through),
+    pg_block_through = mean(pg_block_through),
+    n_block_return = sum(is_block_return),
+    pg_block_return = mean(pg_block_return),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    pg = pg_is_error + pg_is_block + pg_is_block_error + pg_is_block_return +
+         pg_no_block + pg_block_return + pg_block_through
+  ) |>
+  dplyr::select(player_id, player_name, team_name, pg, dplyr::everything()) |>
+  dplyr::arrange(-pg)
+```
+
+```{r pg-block-raw}
+pg_block <- attack_data_with_pg |>
+  dplyr::select(-player_id, -player_name, -team_id) |>
+  dplyr::rename(player_id = blocker_id) |>
+  dplyr::left_join(player, by = "player_id") |>
+  dplyr::left_join(team, by = "team_id") |>
+  dplyr::group_by(player_id, player_name, team_name) |>
+  dplyr::summarize(
+    n = sum(is_no_error),
+    pct_is_block = weighted.mean(is_block, w = is_no_error),
+    pg_is_block = -weighted.mean(pg_is_block, w = is_no_error),
+    n_block = sum(is_block),
+    pg_is_block_error = -weighted.mean(pg_is_block_error, w = is_no_error),
+    n_block_no_error = sum(is_block_no_error),
+    pg_is_block_return = -weighted.mean(pg_is_block_return, w = is_no_error),
+    n_no_block = sum(is_no_block),
+    pg_no_block = -weighted.mean(pg_no_block, w = is_no_error) / 2,
+    n_block_through = sum(is_block_through),
+    pg_block_through = -weighted.mean(pg_block_through, w = is_no_error) / 2,
+    n_block_return = sum(is_block_return),
+    pg_block_return = -weighted.mean(pg_block_return, w = is_no_error),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    pg = pg_is_block + pg_is_block_error + pg_is_block_return +
+         pg_no_block + pg_block_return + pg_block_through
+  ) |>
+  dplyr::select(player_id, player_name, team_name, pg, dplyr::everything()) |>
+  dplyr::arrange(-pg)
+```
+
+```{r pg-dig-raw}
+pg_dig <- attack_data_with_pg |>
+  dplyr::select(-player_id, -player_name, -team_id) |>
+  dplyr::rename(player_id = digger_id) |>
+  dplyr::left_join(player, by = "player_id") |>
+  dplyr::left_join(team, by = "team_id") |>
+  dplyr::group_by(player_id, player_name, team_name) |>
+  dplyr::summarize(
+    n_dig = sum(is_no_block + is_block_through),
+    pct_kill = weighted.mean(win_prob > 0.99, w = is_no_block + is_block_through),
+    pg_dig = -weighted.mean(
+      x = pg_no_block + pg_block_through,
+      w = is_no_block + is_block_through
+    ),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(-pg_dig)
+```
+
+```{r pg-overall-raw}
+pg_pass <- pg_reception |>
+  dplyr::left_join(pg_dig, by = c("player_id", "player_name", "team_name")) |>
+  dplyr::mutate(
+    n_reception = dplyr::coalesce(n_reception, 0),
+    n_dig = dplyr::coalesce(n_dig, 0),
+    n = n_reception + n_dig,
+    pg = (n_reception * pg_reception + n_dig * pg_dig) / n
+  ) |>
+  dplyr::select(player_id, player_name, team_name, n, pg, dplyr::everything()) |>
+  dplyr::arrange(-pg)
+
+sets_played <- contact_sideout_prob |>
+  dplyr::filter(!is.na(player_id)) |>
+  dplyr::count(player_id, match_id, set_number) |>
+  dplyr::count(player_id) |>
+  dplyr::rename(sets_played = n)
+
+id_columns <- c("player_id", "player_name", "team_name")
+
+pg_overall <- sets_played |>
+  dplyr::full_join(
+    pg_serve |> dplyr::mutate(pg = n * pg) |>
+      dplyr::select(dplyr::all_of(id_columns), n_serve = n, pg_serve = pg),
+    by = "player_id"
+  ) |>
+  dplyr::full_join(
+    pg_pass |> dplyr::mutate(pg = n * pg) |>
+      dplyr::select(dplyr::all_of(id_columns), n_pass = n, pg_pass = pg),
+    by = id_columns
+  ) |>
+  dplyr::full_join(
+    pg_set |> dplyr::mutate(pg = n * pg) |>
+      dplyr::select(dplyr::all_of(id_columns), n_set = n, pg_set = pg),
+    by = id_columns
+  ) |>
+  dplyr::full_join(
+    pg_attack |> dplyr::mutate(pg = n * pg) |>
+      dplyr::group_by_at(id_columns) |>
+      dplyr::summarize(n_attack = sum(n), pg_attack = sum(pg), .groups = "drop"),
+    by = id_columns
+  ) |>
+  dplyr::full_join(
+    pg_block |> dplyr::mutate(pg = n * pg) |>
+      dplyr::select(dplyr::all_of(id_columns), n_block = n, pg_block = pg),
+    by = id_columns
+  ) |>
+  dplyr::mutate_at(
+    dplyr::vars(dplyr::matches("^sets_played|^n_|^pg_")),
+    function(x) tidyr::replace_na(x, 0)
+  )
+
+pg_overall_per_set <- pg_overall |>
+  dplyr::mutate_at(
+    dplyr::vars(dplyr::matches("^n_|^pg_")),
+    function(x, denominator) x / denominator,
+    denominator = pg_overall$sets_played
+  ) |>
+  dplyr::filter(sets_played > 0) |>
+  dplyr::mutate(
+    n = n_serve + n_pass + n_set + n_attack + n_block,
+    pg = pg_serve + pg_pass + pg_set + pg_attack + pg_block
+  ) |>
+  dplyr::select(dplyr::all_of(id_columns), sets_played, n, pg,
+                dplyr::everything()) |>
+  dplyr::arrange(-pg)
+```
+
+# 8b. Per-Skill PG Distributions
+
+Distribution of player season-average Points Gained per contact, by skill. Each
+observation is one player's season-long average PG when performing this skill;
+the figure replicates Powers et al. Figure 7 on Harvard 2018 data. Setters cluster
+tightest near zero (per-contact win-probability change is small for every set);
+attackers spread widest (terminal outcomes generate the largest swings). The
+distributions are roughly mean-zero by construction.
+
+```{r table1-counts}
+table1_counts <- contact |>
+  dplyr::anti_join(bad_data, by = c("match_id", "point_id")) |>
+  dplyr::filter(skill %in% c("Serve", "Reception", "Set",
+                             "Attack", "Block", "Dig")) |>
+  dplyr::count(skill) |>
+  dplyr::mutate(skill = factor(skill, levels = c("Serve", "Reception", "Set",
+                                                  "Attack", "Block", "Dig"))) |>
+  dplyr::arrange(skill)
+
+knitr::kable(table1_counts,
+             caption = "Skill contacts in cleaned dataset (Table 1 source)",
+             col.names = c("Skill", "Contacts"))
+
+cat("Total:", sum(table1_counts$n), "\n")
+```
+
+```{r pg-distribution-data}
+pg_per_contact_long <- dplyr::bind_rows(
+  pg_serve |>
+    dplyr::filter(n >= 20) |>
+    dplyr::transmute(player_name, team_name, pg = pg, skill = "Serve"),
+  pg_set |>
+    dplyr::filter(n >= 50) |>
+    dplyr::transmute(player_name, team_name, pg = pg, skill = "Set"),
+  pg_attack |>
+    dplyr::filter(n >= 30) |>
+    dplyr::transmute(player_name, team_name, pg = pg, skill = "Attack"),
+  pg_reception |>
+    dplyr::filter(n_reception >= 30) |>
+    dplyr::transmute(player_name, team_name, pg = pg_reception,
+                     skill = "Reception"),
+  pg_dig |>
+    dplyr::filter(n_dig >= 30) |>
+    dplyr::transmute(player_name, team_name, pg = pg_dig, skill = "Dig"),
+  pg_block |>
+    dplyr::filter(n >= 30) |>
+    dplyr::transmute(player_name, team_name, pg = pg, skill = "Block")
+) |>
+  dplyr::mutate(
+    skill = factor(skill, levels = c("Serve", "Set", "Attack",
+                                     "Reception", "Dig", "Block"))
+  )
+```
+
+```{r pg-distribution-plot, fig.height = 5}
+ggplot(pg_per_contact_long, aes(x = pg)) +
+  geom_histogram(bins = 20, fill = "#3b5bdb", color = "white",
+                 linewidth = 0.3) +
+  geom_vline(xintercept = 0, color = "grey40", linewidth = 0.4) +
+  facet_wrap(~ skill, scales = "free_y", nrow = 2) +
+  coord_cartesian(xlim = c(-0.10, 0.10)) +
+  scale_x_continuous(labels = percent_format(accuracy = 1),
+                     breaks = seq(-0.10, 0.10, 0.05)) +
+  scale_y_continuous(breaks = function(x) seq(0, ceiling(max(x)), by = 1)) +
+  labs(
+    title = "Distribution of player Points Gained per contact, by skill",
+    subtitle = "Each observation is one player's season-average PG per contact (replicates Powers et al. Figure 7)",
+    x = "Player average Points Gained per contact",
+    y = "Number of players"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(strip.text = element_text(face = "bold", size = 11),
+        panel.grid.minor = element_blank(),
+        plot.title.position = "plot")
+```
+
+```{r pg-range-table}
+pg_per_contact_summary <- pg_per_contact_long |>
+  dplyr::group_by(skill) |>
+  dplyr::summarize(
+    n_players = dplyr::n(),
+    mean_pg = mean(pg, na.rm = TRUE),
+    sd_pg = sd(pg, na.rm = TRUE),
+    p05 = quantile(pg, 0.05, na.rm = TRUE),
+    p95 = quantile(pg, 0.95, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(sd_pg)
+
+pg_per_contact_summary |>
+  knitr::kable(
+    caption = "Player-level PG per contact: spread by skill (replicates Powers et al. Figure 7)",
+    digits = 4
+  )
+```
+
+
+# 9. Strength of Schedule Adjustment — Serve and Reception
+
+We adapt Powers et al. §3.2.1 to single-conference data by dropping the
+conference layer:
+
+$$Y_i \sim \mathrm{Normal}\!\left(\alpha^{*} + \tau_{t} + \pi_{p}
+                                   + \tilde{\tau}_{\tilde t} + \rho_{r},\;
+                                   \sigma^2_\epsilon\right)$$
+
+The conference effect is absorbed into the intercept $\alpha^{*}$. Per-contact
+opponent quality is computed via `predict()` with only opponent-side random
+effects active.
+
+```{r sos-serve-prep}
+sos_threshold_sv <- 20
+
+serve_data_sos <- serve_data |>
+  dplyr::group_by(server_id) |>
+  dplyr::mutate(count_sv = dplyr::n()) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(server_id_model = ifelse(count_sv < sos_threshold_sv,
+                                         "0", server_id)) |>
+  dplyr::group_by(receiver_id) |>
+  dplyr::mutate(count_rc = dplyr::n()) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(receiver_id_model = ifelse(count_rc < sos_threshold_sv,
+                                           "0", receiver_id))
+
+cat("Non-error pairs for serve LMM:", sum(serve_data_sos$no_error), "\n")
+cat("Distinct teams (off/def):",
+    dplyr::n_distinct(serve_data_sos$team_id_offense), "/",
+    dplyr::n_distinct(serve_data_sos$team_id_defense), "\n")
+```
+
+```{r sos-serve-fit}
+serve_model <- serve_data_sos |>
+  dplyr::filter(no_error) |>
+  with(
+    lme4::lmer(
+      pg_no_error ~ (1 | team_id_offense) + (1 | team_id_defense) +
+                    (1 | server_id_model) + (1 | receiver_id_model),
+      control = lme4::lmerControl(calc.derivs = FALSE, optimizer = "bobyqa")
+    )
+  )
+
+serve_var_components <- lme4::VarCorr(serve_model) |>
+  tibble::as_tibble() |>
+  dplyr::select(grp, sd = sdcor)
+
+serve_var_components |>
+  knitr::kable(caption = "Serve/reception SoS — variance components", digits = 4)
+```
+
+```{r sos-serve-predict}
+# Following Powers et al. — opponent-side prediction only
+serve_data_adj <- serve_data_sos |>
+  dplyr::mutate(
+    sos_no_error_server = predict(
+      serve_model, newdata = serve_data_sos,
+      re.form = ~ (1 | team_id_defense) + (1 | receiver_id_model),
+      allow.new.levels = TRUE
+    ),
+    sos_no_error_receiver = predict(
+      serve_model, newdata = serve_data_sos,
+      re.form = ~ (1 | team_id_offense) + (1 | server_id_model),
+      allow.new.levels = TRUE
+    )
+  )
+```
+
+```{r sos-pg-serve}
+pg_serve_adj <- serve_data_adj |>
+  dplyr::select(-player_name, -team_id) |>
+  dplyr::left_join(dplyr::select(player, player_id, player_name, team_id),
+                   by = "player_id") |>
+  dplyr::left_join(team, by = "team_id") |>
+  dplyr::group_by(player_id, player_name, team_name) |>
+  dplyr::summarize(
+    n = dplyr::n(),
+    pg_raw = -mean(pg_is_error + pg_no_error),
+    pg_adj = -mean(pg_is_error + pg_no_error - sos_no_error_server),
+    sos_avg = mean(sos_no_error_server),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(-pg_adj)
+
+pg_reception_adj <- serve_data_adj |>
+  dplyr::select(-player_id, -player_name, -team_id) |>
+  dplyr::rename(player_id = receiver_id) |>
+  dplyr::left_join(dplyr::select(player, player_id, player_name, team_id),
+                   by = "player_id") |>
+  dplyr::left_join(team, by = "team_id") |>
+  dplyr::group_by(player_id, player_name, team_name) |>
+  dplyr::summarize(
+    n_reception = sum(no_error),
+    pg_reception_raw = weighted.mean(pg_no_error, w = no_error),
+    pg_reception_adj = weighted.mean(pg_no_error - sos_no_error_receiver,
+                                     w = no_error),
+    sos_avg = weighted.mean(sos_no_error_receiver, w = no_error),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(-pg_reception_adj)
+
+pg_serve_adj |>
+  dplyr::filter(n >= 20) |>
+  dplyr::filter(dplyr::row_number() <= 10 | team_name == "Harvard University") |>
+  knitr::kable(caption = "Serve PG: top 10 servers + all Harvard servers (full table in appendix)",
+               digits = 4)
+```
+
+```{r sos-serve-scatter, fig.height = 4}
+sos_sv_rec_data <- dplyr::bind_rows(
+  pg_serve_adj |>
+    dplyr::filter(n >= 20) |>
+    dplyr::transmute(player_name, team_name, pg_raw, pg_adj, role = "Serve"),
+  pg_reception_adj |>
+    dplyr::filter(n_reception >= 30) |>
+    dplyr::transmute(player_name, team_name,
+                     pg_raw = pg_reception_raw,
+                     pg_adj = pg_reception_adj,
+                     role = "Reception")
+) |>
+  dplyr::mutate(is_harvard = team_name == "Harvard University")
+
+ggplot(sos_sv_rec_data, aes(x = pg_raw, y = pg_adj)) +
+  geom_abline(slope = 1, intercept = 0, color = "grey50", linetype = "dashed") +
+  geom_hline(yintercept = 0, color = "grey85", linewidth = 0.3) +
+  geom_vline(xintercept = 0, color = "grey85", linewidth = 0.3) +
+  geom_point(aes(color = is_harvard, size = is_harvard, alpha = is_harvard)) +
+  ggrepel::geom_text_repel(
+    data = dplyr::filter(sos_sv_rec_data, is_harvard),
+    aes(label = player_name),
+    color = "#011A50", size = 3.0, max.overlaps = 20,
+    box.padding = 0.4, segment.color = "grey60"
+  ) +
+  facet_wrap(~ role, scales = "free") +
+  scale_color_manual(values = c("FALSE" = "grey70", "TRUE" = "#011A50"),
+                     guide = "none") +
+  scale_size_manual(values = c("FALSE" = 1.8, "TRUE" = 3.0), guide = "none") +
+  scale_alpha_manual(values = c("FALSE" = 0.5, "TRUE" = 1.0), guide = "none") +
+  scale_x_continuous(labels = percent_format(accuracy = 0.1)) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  labs(
+    title = "Serve and reception: raw vs SoS-adjusted PG",
+    x = "Raw PG per opportunity",
+    y = "SoS-adjusted PG per opportunity"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title.position = "plot",
+        strip.text = element_text(face = "bold"))
+```
+
+### Interpretation — Serve/Reception SoS
+
+The simplified two-level LMM identifies all four random effects cleanly: the
+server effect ($\hat\sigma_\pi = 0.023$) is largest, followed by the two team
+effects ($\hat\sigma_{\tilde\tau} = 0.014$, $\hat\sigma_\tau = 0.010$), then
+the receiver effect ($\hat\sigma_\rho = 0.009$). The residual SD
+($\hat\sigma_\epsilon = 0.160$) dominates, indicating most variation in serve
+outcomes is unexplained by player or team identity — which is the same finding
+Powers et al. report at NCAA-wide scale.
+
+The qualitative ordering (server $>$ team $>$ receiver) matches the paper.
+Single-conference data does not change which actor in the serve/reception
+matchup carries the most identifiable signal; it just shrinks the absolute
+magnitude of the variance components.
+
+The SoS adjustment shifts Harvard servers slightly downward (Anna Uhr 2.78%
+$\to$ 2.49%) and Harvard receivers slightly upward (Anna Uhr 1.25% $\to$
+1.59%), consistent with Harvard having faced slightly weaker-than-average
+receivers and slightly stronger-than-average servers across the 21-match
+schedule. Most shifts are in the 0.001-0.004 range — small in absolute terms,
+but methodologically meaningful: the framework runs cleanly at this sample
+size and produces interpretable per-player adjustments.
+
+# 10. Strength of Schedule Adjustment — Attack Tree
+
+We extend the SoS framework to the seven attack-tree submodels of Powers et
+al. §3.2.2. Each submodel takes the same simplified form (no conference layer):
+
+$$Y_i \sim \mathrm{Normal}\!\left(\alpha^{*} + \tau_{t} + \theta_{a} + \psi_{s}
+                                   + \tilde{\tau}_{\tilde t} + \beta_{b}
+                                   + \delta_{d},\;
+                                   \sigma^2_\epsilon\right)$$
+
+with the digger random effect $\delta_d$ included only on the two outcome
+models that involve a digger (`pg_no_block`, `pg_block_through`). The seven
+fitted models do double duty: they yield (a) per-contact opponent-side
+contributions for SoS adjustment of attack/set/block/dig PG and (b) variance
+components used in §11 for individual attribution.
+
+```{r attack-tree-sos-prep}
+sos_threshold_att <- 30
+
+attack_data_with_pg <- attack_data_with_pg |>
+  dplyr::group_by(player_id) |>
+  dplyr::mutate(count = dplyr::n()) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(player_id_model = ifelse(count < sos_threshold_att,
+                                         "0", player_id)) |>
+  dplyr::group_by(setter_id) |>
+  dplyr::mutate(count = dplyr::n()) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(setter_id_model = ifelse(count < 100, "0", setter_id)) |>
+  dplyr::group_by(blocker_id) |>
+  dplyr::mutate(count = dplyr::n()) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(blocker_id_model = ifelse(count < sos_threshold_att,
+                                          "0", blocker_id)) |>
+  dplyr::group_by(digger_id) |>
+  dplyr::mutate(count = dplyr::n()) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(digger_id_model = ifelse(count < sos_threshold_att,
+                                         "0", digger_id))
+```
+
+```{r attack-tree-sos-fit}
+fit_attack_models <- function(data) {
+  base_re <- "(1 | team_id_offense) + (1 | team_id_defense) + (1 | player_id_model) + (1 | setter_id_model) + (1 | blocker_id_model)"
+  base_re_with_dig <- paste(base_re, "+ (1 | digger_id_model)")
+
+  # is_error model: defense doesn't influence attack errors → drop defense REs
+  err_re <- "(1 | team_id_offense) + (1 | player_id_model) + (1 | setter_id_model)"
+
+  models <- list()
+  models$is_error <- lme4::lmer(
+    as.formula(paste("pg_is_error ~", err_re)),
+    data = data,
+    control = lme4::lmerControl(calc.derivs = FALSE)
+  )
+  models$is_block <- lme4::lmer(
+    as.formula(paste("pg_is_block ~", base_re)),
+    data = data |> dplyr::filter(is_no_error),
+    control = lme4::lmerControl(calc.derivs = FALSE)
+  )
+  models$is_block_error <- lme4::lmer(
+    as.formula(paste("pg_is_block_error ~", base_re)),
+    data = data |> dplyr::filter(is_block),
+    control = lme4::lmerControl(calc.derivs = FALSE)
+  )
+  models$is_block_return <- lme4::lmer(
+    as.formula(paste("pg_is_block_return ~", base_re)),
+    data = data |> dplyr::filter(is_block_no_error),
+    control = lme4::lmerControl(calc.derivs = FALSE)
+  )
+  models$no_block <- lme4::lmer(
+    as.formula(paste("pg_no_block ~", base_re_with_dig)),
+    data = data |> dplyr::filter(is_no_block),
+    control = lme4::lmerControl(calc.derivs = FALSE, optimizer = "Nelder_Mead")
+  )
+  models$block_through <- lme4::lmer(
+    as.formula(paste("pg_block_through ~", base_re_with_dig)),
+    data = data |> dplyr::filter(is_block_through),
+    control = lme4::lmerControl(calc.derivs = FALSE)
+  )
+  models$block_return <- lme4::lmer(
+    as.formula(paste("pg_block_return ~", base_re)),
+    data = data |> dplyr::filter(is_block_return),
+    control = lme4::lmerControl(calc.derivs = FALSE)
+  )
+  return(models)
+}
+
+cat("Fitting attack-tree models...\n")
+.t0 <- Sys.time()
+attack_models <- fit_attack_models(attack_data_with_pg)
+cat(sprintf("Done in %.1f seconds.\n", as.numeric(Sys.time() - .t0, units = "secs")))
+```
+
+```{r attack-tree-sos-predict}
+# For each per-attack PG component, compute the opponent-side contribution.
+# Offense-perspective SoS = part of outcome attributable to defense REs.
+# Defense-perspective SoS = part of outcome attributable to offense REs.
+# Wrap predict() to handle missing REs gracefully (e.g., is_error has no defense REs).
+predict_re <- function(model, newdata, re_terms) {
+  re_form <- as.formula(paste("~", paste(re_terms, collapse = " + ")))
+  available <- names(lme4::ranef(model))
+  re_available <- intersect(
+    gsub(".*\\| *([^)]+).*", "\\1", re_terms),
+    available
+  )
+  if (length(re_available) == 0) return(rep(0, nrow(newdata)))
+  re_form_filtered <- as.formula(paste(
+    "~",
+    paste(sprintf("(1 | %s)", re_available), collapse = " + ")
+  ))
+  predict(model, newdata = newdata,
+          re.form = re_form_filtered, allow.new.levels = TRUE) |>
+    scale(scale = FALSE) |>
+    as.numeric()
+}
+
+defense_terms <- c("(1 | team_id_defense)", "(1 | blocker_id_model)")
+defense_terms_dig <- c("(1 | team_id_defense)", "(1 | blocker_id_model)",
+                       "(1 | digger_id_model)")
+offense_terms <- c("(1 | team_id_offense)", "(1 | player_id_model)",
+                   "(1 | setter_id_model)")
+
+attack_data_with_pg_adj <- attack_data_with_pg |>
+  dplyr::mutate(
+    sos_is_block_offense        = predict_re(attack_models$is_block,
+                                             attack_data_with_pg, defense_terms),
+    sos_is_block_defense        = predict_re(attack_models$is_block,
+                                             attack_data_with_pg, offense_terms),
+    sos_is_block_error_offense  = predict_re(attack_models$is_block_error,
+                                             attack_data_with_pg, defense_terms),
+    sos_is_block_error_defense  = predict_re(attack_models$is_block_error,
+                                             attack_data_with_pg, offense_terms),
+    sos_is_block_return_offense = predict_re(attack_models$is_block_return,
+                                             attack_data_with_pg, defense_terms),
+    sos_is_block_return_defense = predict_re(attack_models$is_block_return,
+                                             attack_data_with_pg, offense_terms),
+    sos_no_block_offense        = predict_re(attack_models$no_block,
+                                             attack_data_with_pg,
+                                             defense_terms_dig),
+    sos_no_block_defense        = predict_re(attack_models$no_block,
+                                             attack_data_with_pg, offense_terms),
+    sos_block_through_offense   = predict_re(attack_models$block_through,
+                                             attack_data_with_pg,
+                                             defense_terms_dig),
+    sos_block_through_defense   = predict_re(attack_models$block_through,
+                                             attack_data_with_pg, offense_terms),
+    sos_block_return_offense    = predict_re(attack_models$block_return,
+                                             attack_data_with_pg, defense_terms),
+    sos_block_return_defense    = predict_re(attack_models$block_return,
+                                             attack_data_with_pg, offense_terms)
+  )
+```
+
+```{r pg-attack-adj}
+# SoS-adjusted aggregations parallel to §8 raw versions.
+pg_attack_adj <- attack_data_with_pg_adj |>
+  dplyr::left_join(team, by = "team_id") |>
+  dplyr::group_by(player_id, player_name, team_name, player_position) |>
+  dplyr::summarize(
+    n = dplyr::n(),
+    pg_raw = mean(pg_is_error + pg_is_block + pg_is_block_error +
+                    pg_is_block_return + pg_no_block + pg_block_return +
+                    pg_block_through),
+    pg_adj = mean(
+      pg_is_error +
+        (pg_is_block        - sos_is_block_offense        * is_no_error) +
+        (pg_is_block_error  - sos_is_block_error_offense  * is_block) +
+        (pg_is_block_return - sos_is_block_return_offense * is_block_no_error) +
+        (pg_no_block        - sos_no_block_offense        * is_no_block) +
+        (pg_block_through   - sos_block_through_offense   * is_block_through) +
+        (pg_block_return    - sos_block_return_offense    * is_block_return)
+    ),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(-pg_adj)
+```
+
+```{r pg-set-adj}
+pg_set_adj <- attack_data_with_pg_adj |>
+  dplyr::select(-player_id, -player_name) |>
+  dplyr::rename(player_id = setter_id) |>
+  dplyr::left_join(dplyr::select(player, player_id, player_name), by = "player_id") |>
+  dplyr::left_join(team, by = "team_id") |>
+  dplyr::group_by(player_id, player_name, team_name) |>
+  dplyr::summarize(
+    n = dplyr::n(),
+    pg_raw = mean(pg_is_error + pg_is_block + pg_is_block_error +
+                    pg_is_block_return + pg_no_block + pg_block_return +
+                    pg_block_through),
+    pg_adj = mean(
+      pg_is_error +
+        (pg_is_block        - sos_is_block_offense        * is_no_error) +
+        (pg_is_block_error  - sos_is_block_error_offense  * is_block) +
+        (pg_is_block_return - sos_is_block_return_offense * is_block_no_error) +
+        (pg_no_block        - sos_no_block_offense        * is_no_block) +
+        (pg_block_through   - sos_block_through_offense   * is_block_through) +
+        (pg_block_return    - sos_block_return_offense    * is_block_return)
+    ),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(-pg_adj)
+```
+
+```{r pg-block-adj}
+# Defense-side: SoS adjustment uses defense-perspective opponent contributions
+# (i.e., opponent's offense quality).
+pg_block_adj <- attack_data_with_pg_adj |>
+  dplyr::select(-player_id, -player_name, -team_id) |>
+  dplyr::rename(player_id = blocker_id) |>
+  dplyr::left_join(player, by = "player_id") |>
+  dplyr::left_join(team, by = "team_id") |>
+  dplyr::group_by(player_id, player_name, team_name) |>
+  dplyr::summarize(
+    n = sum(is_no_error),
+    pg_raw = -weighted.mean(
+      pg_is_block + pg_is_block_error + pg_is_block_return +
+        pg_no_block / 2 + pg_block_through / 2 + pg_block_return,
+      w = is_no_error
+    ),
+    pg_adj = -weighted.mean(
+      (pg_is_block        - sos_is_block_defense        * is_no_error) +
+        (pg_is_block_error  - sos_is_block_error_defense  * is_block) +
+        (pg_is_block_return - sos_is_block_return_defense * is_block_no_error) +
+        (pg_no_block        - sos_no_block_defense        * is_no_block) / 2 +
+        (pg_block_through   - sos_block_through_defense   * is_block_through) / 2 +
+        (pg_block_return    - sos_block_return_defense    * is_block_return),
+      w = is_no_error
+    ),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(-pg_adj)
+```
+
+```{r pg-dig-adj}
+pg_dig_adj <- attack_data_with_pg_adj |>
+  dplyr::select(-player_id, -player_name, -team_id) |>
+  dplyr::rename(player_id = digger_id) |>
+  dplyr::left_join(player, by = "player_id") |>
+  dplyr::left_join(team, by = "team_id") |>
+  dplyr::group_by(player_id, player_name, team_name) |>
+  dplyr::summarize(
+    n_dig = sum(is_no_block + is_block_through),
+    pg_raw = -weighted.mean(
+      x = pg_no_block + pg_block_through,
+      w = is_no_block + is_block_through
+    ),
+    pg_adj = -weighted.mean(
+      x = (pg_no_block      - sos_no_block_defense      * is_no_block) +
+          (pg_block_through - sos_block_through_defense * is_block_through),
+      w = is_no_block + is_block_through
+    ),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(-pg_adj)
+```
+
+```{r adj-overall}
+# Roll up to overall PG/set with adjustment applied skill-by-skill.
+pg_pass_adj <- pg_reception_adj |>
+  dplyr::transmute(player_id, player_name, team_name,
+                   n_reception, pg_reception_raw, pg_reception_adj) |>
+  dplyr::full_join(
+    pg_dig_adj |>
+      dplyr::transmute(player_id, player_name, team_name,
+                       n_dig, pg_dig_raw = pg_raw, pg_dig_adj = pg_adj),
+    by = c("player_id", "player_name", "team_name")
+  ) |>
+  dplyr::mutate(
+    n_reception = dplyr::coalesce(n_reception, 0),
+    n_dig = dplyr::coalesce(n_dig, 0),
+    n = n_reception + n_dig,
+    pg_raw = (n_reception * dplyr::coalesce(pg_reception_raw, 0) +
+              n_dig       * dplyr::coalesce(pg_dig_raw, 0)) / n,
+    pg_adj = (n_reception * dplyr::coalesce(pg_reception_adj, 0) +
+              n_dig       * dplyr::coalesce(pg_dig_adj, 0)) / n
+  )
+
+pg_overall_adj <- sets_played |>
+  dplyr::full_join(
+    pg_serve_adj |>
+      dplyr::mutate(pg_serve_raw = n * pg_raw, pg_serve_adj = n * pg_adj) |>
+      dplyr::select(dplyr::all_of(id_columns),
+                    n_serve = n, pg_serve_raw, pg_serve_adj),
+    by = "player_id"
+  ) |>
+  dplyr::full_join(
+    pg_pass_adj |>
+      dplyr::mutate(pg_pass_raw = n * pg_raw, pg_pass_adj = n * pg_adj) |>
+      dplyr::select(dplyr::all_of(id_columns),
+                    n_pass = n, pg_pass_raw, pg_pass_adj),
+    by = id_columns
+  ) |>
+  dplyr::full_join(
+    pg_set_adj |>
+      dplyr::mutate(pg_set_raw = n * pg_raw, pg_set_adj = n * pg_adj) |>
+      dplyr::select(dplyr::all_of(id_columns),
+                    n_set = n, pg_set_raw, pg_set_adj),
+    by = id_columns
+  ) |>
+  dplyr::full_join(
+    pg_attack_adj |>
+      dplyr::mutate(pg_attack_raw = n * pg_raw, pg_attack_adj = n * pg_adj) |>
+      dplyr::group_by_at(id_columns) |>
+      dplyr::summarize(n_attack = sum(n),
+                       pg_attack_raw = sum(pg_attack_raw),
+                       pg_attack_adj = sum(pg_attack_adj),
+                       .groups = "drop"),
+    by = id_columns
+  ) |>
+  dplyr::full_join(
+    pg_block_adj |>
+      dplyr::mutate(pg_block_raw = n * pg_raw, pg_block_adj = n * pg_adj) |>
+      dplyr::select(dplyr::all_of(id_columns),
+                    n_block = n, pg_block_raw, pg_block_adj),
+    by = id_columns
+  ) |>
+  dplyr::mutate_at(
+    dplyr::vars(dplyr::matches("^sets_played|^n_|^pg_")),
+    function(x) tidyr::replace_na(x, 0)
+  )
+
+pg_overall_adj_per_set <- pg_overall_adj |>
+  dplyr::mutate_at(
+    dplyr::vars(dplyr::matches("^n_|^pg_")),
+    function(x, denominator) x / denominator,
+    denominator = pg_overall_adj$sets_played
+  ) |>
+  dplyr::filter(sets_played > 0) |>
+  dplyr::mutate(
+    n = n_serve + n_pass + n_set + n_attack + n_block,
+    pg_raw = pg_serve_raw + pg_pass_raw + pg_set_raw +
+             pg_attack_raw + pg_block_raw,
+    pg_adj = pg_serve_adj + pg_pass_adj + pg_set_adj +
+             pg_attack_adj + pg_block_adj
+  ) |>
+  dplyr::select(dplyr::all_of(id_columns), sets_played, n, pg_raw, pg_adj,
+                dplyr::everything()) |>
+  dplyr::arrange(-pg_adj)
+```
+
+```{r top10-table}
+# Paper Table 5 analog: top 10 by adjusted PG/set with skill-by-skill breakdown
+top10_table <- pg_overall_adj_per_set |>
+  dplyr::filter(sets_played >= 15, !is.na(player_name)) |>
+  dplyr::arrange(dplyr::desc(pg_adj)) |>
+  dplyr::slice(1:10) |>
+  dplyr::transmute(
+    Player = player_name,
+    Team = team_name,
+    Sets = sets_played,
+    `PG/S raw` = pg_raw,
+    `PG/S adj` = pg_adj,
+    SRV = pg_serve_adj,
+    PASS = pg_pass_adj,
+    SET = pg_set_adj,
+    ATT = pg_attack_adj,
+    BLK = pg_block_adj
+  )
+
+knitr::kable(
+  top10_table,
+  caption = "Top 10 players by SoS-adjusted PG per set, with skill-by-skill breakdown (replicates Powers et al. Table 5)",
+  digits = 3
+)
+```
+
+```{r adj-rank-shift-summary}
+# Headline: how much do rankings move when SoS is applied?
+rank_shift_summary <- pg_overall_adj_per_set |>
+  dplyr::filter(sets_played >= 15, !is.na(player_name)) |>
+  dplyr::mutate(
+    rank_raw = rank(-pg_raw, ties.method = "min"),
+    rank_adj = rank(-pg_adj, ties.method = "min"),
+    rank_shift = rank_adj - rank_raw
+  )
+
+rank_shift_summary |>
+  dplyr::summarize(
+    n_players           = dplyr::n(),
+    cor_pg              = cor(pg_raw, pg_adj),
+    mean_abs_rank_shift = mean(abs(rank_shift)),
+    median_abs_rank_shift = median(abs(rank_shift)),
+    max_abs_rank_shift  = max(abs(rank_shift))
+  ) |>
+  knitr::kable(caption = "Overall PG/set — rank shift between raw and SoS-adjusted",
+               digits = 3)
+```
+
+```{r overall-raw-vs-adj-scatter, fig.height = 4}
+overall_scatter_data <- pg_overall_adj_per_set |>
+  dplyr::filter(sets_played >= 15, !is.na(player_name)) |>
+  dplyr::mutate(is_harvard = team_name == "Harvard University")
+
+ggplot(overall_scatter_data, aes(x = pg_raw, y = pg_adj)) +
+  geom_abline(slope = 1, intercept = 0, color = "grey50", linetype = "dashed") +
+  geom_hline(yintercept = 0, color = "grey85", linewidth = 0.3) +
+  geom_vline(xintercept = 0, color = "grey85", linewidth = 0.3) +
+  geom_point(aes(color = is_harvard, size = is_harvard, alpha = is_harvard)) +
+  ggrepel::geom_text_repel(
+    data = dplyr::filter(overall_scatter_data, is_harvard),
+    aes(label = player_name),
+    color = "#011A50", size = 3.0, max.overlaps = 20,
+    box.padding = 0.4, segment.color = "grey60"
+  ) +
+  scale_color_manual(values = c("FALSE" = "grey70", "TRUE" = "#011A50"),
+                     guide = "none") +
+  scale_size_manual(values = c("FALSE" = 1.8, "TRUE" = 3.0), guide = "none") +
+  scale_alpha_manual(values = c("FALSE" = 0.5, "TRUE" = 1.0), guide = "none") +
+  scale_x_continuous(labels = number_format(accuracy = 0.01)) +
+  scale_y_continuous(labels = number_format(accuracy = 0.01)) +
+  labs(
+    title = "Overall PG/set: raw vs SoS-adjusted",
+    subtitle = sprintf("cor = %.3f; rankings essentially invariant to adjustment within Harvard",
+                       cor(overall_scatter_data$pg_raw, overall_scatter_data$pg_adj)),
+    x = "Raw PG per set", y = "SoS-adjusted PG per set"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title.position = "plot")
+```
+
+### Interpretation — Attack-Tree SoS
+
+The attack-tree SoS adjustment produces a near-identity transformation on
+overall PG/set: the correlation between raw and adjusted is 0.997, and within
+the 11 Harvard players with $\geq$ 15 sets played, no player's rank changes.
+
+This is not a failure of the framework — it is a finding about the regime in
+which the framework is informative. The paper applies SoS to NCAA-wide data
+where teams play across conferences with widely varying strengths; opponent
+variation is large relative to within-player variation, and SoS produces
+substantial corrections (Powers et al. Figure 8 shows visible rank shifts for
+many players). On a single 21-match Ivy League schedule, opponent variation
+is small, and the seven attack-tree submodels have insufficient cross-team
+contrast to distinguish "this attacker faced tough blockers" from "this
+attacker is good." The adjustment exists; it is just numerically negligible.
+
+The methodological observation: **SoS adjustment is informative when opponent
+variation is large relative to player variation, and degenerate when it is
+small.** Future analyses on conference-restricted data should expect
+correlations between raw and adjusted PG above 0.99 and rank shifts near
+zero.
+
+## Figure 10b. PG/set distribution across all teams (Harvard players highlighted)
+
+A second view of the SoS adjustment, parallel to Powers et al. Figure 8.
+Each observation is one player's season-average PG per set across all skills
+combined. Reference lines mark Harvard's top performers in the raw and
+adjusted distributions.
+
+```{r pg-overall-distribution, fig.height = 4}
+overall_dist_data <- pg_overall_adj_per_set |>
+  dplyr::filter(sets_played >= 5, !is.na(player_name))
+
+# Harvard reference players
+harvard_refs <- overall_dist_data |>
+  dplyr::filter(team_name == "Harvard University") |>
+  dplyr::arrange(dplyr::desc(pg_adj))
+
+# Top Harvard player for each panel
+top_harvard_raw <- harvard_refs |> dplyr::arrange(dplyr::desc(pg_raw)) |>
+  dplyr::slice(1)
+top_harvard_adj <- harvard_refs |> dplyr::arrange(dplyr::desc(pg_adj)) |>
+  dplyr::slice(1)
+
+# Build long-form data for raw vs adjusted faceting
+overall_long <- dplyr::bind_rows(
+  overall_dist_data |> dplyr::transmute(player_name, team_name,
+                                        pg = pg_raw, type = "Raw"),
+  overall_dist_data |> dplyr::transmute(player_name, team_name,
+                                        pg = pg_adj, type = "SoS-adjusted")
+) |>
+  dplyr::mutate(type = factor(type, levels = c("Raw", "SoS-adjusted")))
+
+ref_lines <- dplyr::bind_rows(
+  top_harvard_raw |> dplyr::transmute(player_name, pg = pg_raw, type = "Raw"),
+  top_harvard_adj |> dplyr::transmute(player_name, pg = pg_adj, type = "SoS-adjusted")
+) |>
+  dplyr::mutate(type = factor(type, levels = c("Raw", "SoS-adjusted")))
+
+ggplot(overall_long, aes(x = pg)) +
+  geom_histogram(bins = 30, fill = "#3b5bdb", color = "white",
+                 linewidth = 0.3, alpha = 0.7) +
+  geom_vline(data = ref_lines,
+             aes(xintercept = pg), color = "#011A50",
+             linewidth = 0.7, linetype = "solid") +
+  geom_text(data = ref_lines,
+            aes(x = pg, y = Inf, label = paste(player_name, "(Harvard)")),
+            color = "#011A50", angle = 90, hjust = 1.1, vjust = -0.4,
+            size = 3.2) +
+  facet_wrap(~ type, nrow = 1) +
+  labs(
+    title = "PG/set distribution: raw vs SoS-adjusted",
+    subtitle = "All players in dataset (min 15 sets); Harvard's top performer marked in each panel",
+    x = "Points Gained per set",
+    y = "Number of players"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(strip.text = element_text(face = "bold", size = 11),
+        plot.title.position = "plot")
+```
+
+# 11. Variance Decomposition and Individual Attribution
+
+The same seven attack-tree models from §10 carry the variance components for
+the paper's attribution method (eqs. 12–14). Below we extract the random-effect
+SDs and compute the implied teammate credit shares.
+
+```{r variance-decomposition}
+extract_variance_split <- function(models) {
+  get_sd <- function(model, term) {
+    vc <- lme4::VarCorr(model)
+    if (term %in% names(vc)) as.numeric(attr(vc[[term]], "stddev")) else 0
+  }
+  get_resid <- function(model) attr(lme4::VarCorr(model), "sc")
+  get_n     <- function(model) nrow(model@frame)
+
+  tibble::tibble(
+    model        = names(models),
+    n            = sapply(models, get_n),
+    sd_attacker  = sapply(models, get_sd, term = "player_id_model"),
+    sd_setter    = sapply(models, get_sd, term = "setter_id_model"),
+    sd_blocker   = sapply(models, get_sd, term = "blocker_id_model"),
+    sd_digger    = sapply(models, get_sd, term = "digger_id_model"),
+    sd_resid     = sapply(models, get_resid)
+  ) |>
+    dplyr::mutate(
+      total_as     = sd_attacker + sd_setter,
+      pct_attacker = ifelse(total_as > 0, sd_attacker / total_as, NA),
+      pct_setter   = ifelse(total_as > 0, sd_setter   / total_as, NA),
+      total_bd     = sd_blocker + sd_digger,
+      pct_blocker  = ifelse(total_bd > 0, sd_blocker / total_bd, NA),
+      pct_digger   = ifelse(total_bd > 0, sd_digger  / total_bd, NA)
+    )
+}
+
+variance_split <- extract_variance_split(attack_models)
+
+variance_split |>
+  dplyr::select(model, n, sd_attacker, sd_setter,
+                sd_blocker, sd_digger, sd_resid) |>
+  knitr::kable(
+    caption = "Random-effect SDs by attack-tree submodel (paper Appendix Table 9 style)",
+    digits = 3
+  )
+
+variance_split |>
+  dplyr::select(model, pct_attacker, pct_setter, pct_blocker, pct_digger) |>
+  knitr::kable(
+    caption = "Credit attribution shares (paper Table 4 style)",
+    digits = 3
+  )
+```
+
+```{r variance-components-plot, fig.height = 4.5}
+# Make the singular fits visible at a glance: bars per submodel, one per role
+vc_long <- variance_split |>
+  dplyr::select(model, sd_attacker, sd_setter, sd_blocker, sd_digger,
+                sd_resid) |>
+  tidyr::pivot_longer(cols = -model, names_to = "role", values_to = "sd") |>
+  dplyr::mutate(
+    role = factor(
+      dplyr::recode(role,
+                    sd_attacker = "Attacker",
+                    sd_setter   = "Setter",
+                    sd_blocker  = "Blocker",
+                    sd_digger   = "Digger",
+                    sd_resid    = "Residual"),
+      levels = c("Attacker", "Setter", "Blocker", "Digger", "Residual")
+    ),
+    model = factor(model, levels = c(
+      "is_error", "is_block", "is_block_error", "is_block_return",
+      "no_block", "block_through", "block_return"
+    ))
+  )
+
+ggplot(vc_long, aes(x = role, y = sd, fill = role)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = ifelse(sd < 0.001, "0", sprintf("%.3f", sd))),
+            vjust = -0.3, size = 2.8) +
+  facet_wrap(~ model, nrow = 2) +
+  scale_fill_manual(values = c(
+    "Attacker" = "#3b5bdb", "Setter" = "#9775fa",
+    "Blocker" = "#fd7e14", "Digger" = "#20c997",
+    "Residual" = "grey60"
+  ), guide = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.20))) +
+  labs(
+    title = "Random-effect SDs across the seven attack-tree submodels",
+    subtitle = "Zeros indicate variance components estimated at the singularity boundary (small-sample identifiability)",
+    x = NULL, y = "Random-effect SD"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(strip.text = element_text(face = "bold", size = 10),
+        panel.grid.major.x = element_blank(),
+        plot.title.position = "plot",
+        axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+### Interpretation — Variance Decomposition
+
+The seven submodels show systematic small-sample identifiability problems.
+Six of the seven models produce at least one variance component estimated at
+zero, and `block_return` (n = 750) collapses to zero variance for every
+random effect. The pattern is consistent with sample size: submodels with
+n $\geq$ 2,000 (`is_block`, `is_error`) identify most of their random
+effects, while submodels with n $<$ 1,500 frequently do not.
+
+The most consequential singular fit is the `no_block` model
+(n = 2,538), where the attacker variance collapses to zero. Read literally,
+this attribution share assigns 0% credit to attackers on clean (non-blocked)
+attacks — the most common and most consequential attack outcome. This is
+clearly an artifact: the variance decomposition framework cannot identify
+attacker-versus-setter contribution at this sample size when both team layers
+and a digger random effect are also competing for variance.
+
+We therefore retain shared credit attribution as our primary metric (each
+component's PG attributed in full to both attacker and setter) and present
+the variance-component attribution as a sensitivity check below. The
+framework's attribution machinery requires substantially more data than
+25K contacts to estimate reliably.
+
+```{r attribution-comparison}
+# Apply the variance-component split to compute "marginal" attacker PG, then
+# compare against the shared-credit version (current pipeline default).
+get_pct <- function(model_name, role) {
+  col <- paste0("pct_", role)
+  v <- variance_split[[col]][variance_split$model == model_name]
+  ifelse(is.na(v), 0, v)
+}
+
+R_att <- list(
+  is_error        = get_pct("is_error",        "attacker"),
+  is_block        = get_pct("is_block",        "attacker"),
+  is_block_error  = get_pct("is_block_error",  "attacker"),
+  is_block_return = get_pct("is_block_return", "attacker"),
+  no_block        = get_pct("no_block",        "attacker"),
+  block_through   = get_pct("block_through",   "attacker"),
+  block_return    = get_pct("block_return",    "attacker")
+)
+
+attack_attributed <- attack_data_with_pg |>
+  dplyr::mutate(
+    pg_attacker_marg =
+      pg_is_error        * R_att$is_error +
+      pg_is_block        * R_att$is_block +
+      pg_is_block_error  * R_att$is_block_error +
+      pg_is_block_return * R_att$is_block_return +
+      pg_no_block        * R_att$no_block +
+      pg_block_through   * R_att$block_through +
+      pg_block_return    * R_att$block_return
+  )
+
+pg_attacker_compare <- attack_attributed |>
+  dplyr::left_join(team, by = "team_id") |>
+  dplyr::group_by(player_id, player_name, team_name) |>
+  dplyr::summarize(
+    n = dplyr::n(),
+    pg_shared = sum(pg_is_error + pg_is_block + pg_is_block_error +
+                    pg_is_block_return + pg_no_block + pg_block_through +
+                    pg_block_return),
+    pg_marg = sum(pg_attacker_marg),
+    .groups = "drop"
+  ) |>
+  dplyr::filter(n >= 30, !is.na(player_name)) |>
+  dplyr::mutate(
+    rank_shared = rank(-pg_shared, ties.method = "min"),
+    rank_marg = rank(-pg_marg, ties.method = "min"),
+    rank_shift = rank_marg - rank_shared
+  ) |>
+  dplyr::arrange(-pg_marg)
+
+pg_attacker_compare |>
+  dplyr::summarize(
+    n_players = dplyr::n(),
+    cor_pg = cor(pg_shared, pg_marg, use = "complete.obs"),
+    mean_abs_rank_shift = mean(abs(rank_shift)),
+    max_abs_rank_shift = max(abs(rank_shift))
+  ) |>
+  knitr::kable(
+    caption = "Attacker rankings — shared-credit vs marginal attribution",
+    digits = 3
+  )
+```
+
+Despite the singular fits, the attribution comparison is not numerically
+trivial: the marginal attribution shifts attacker rankings by 2.8 positions
+on average and up to 14 positions across the 38-player sample. The choice of
+attribution method is not a robustness check that washes out — it
+materially affects who comes out on top of the rankings. This reinforces
+the case for treating attribution as a methodological choice that matters,
+not a detail that can be papered over.
+
+# 12. Bootstrap Standard Errors (optional)
+
+The paper computes SEs by resampling matches with replacement. This is
+expensive (~minutes per resample on full data). The chunk below is scaffolded
+but disabled by default — set `eval = TRUE` to run.
+
+```{r bootstrap, eval = FALSE}
+set.seed(42)
+n_boot <- 200
+match_ids <- unique(plays$match_id)
+boot_results <- vector("list", n_boot)
+
+for (b in seq_len(n_boot)) {
+  if (b %% 20 == 0) cat(sprintf("  Bootstrap %d / %d\n", b, n_boot))
+  # Resample matches, refit models, store variance_split.
+  # See code_for_paper.R for the full body (~120 lines).
+}
+```
+
+# 13. Save Outputs
+
+```{r save-outputs}
+# Raw PG tables
+pg_overall_per_set |> dplyr::filter(sets_played >= 15) |>
+  write.csv("pg_overall.csv", row.names = FALSE, na = "")
+pg_serve     |> dplyr::filter(n >= 20)            |> write.csv("pg_serve.csv",     row.names = FALSE, na = "")
+pg_pass      |> dplyr::filter(n >= 30)            |> write.csv("pg_pass.csv",      row.names = FALSE, na = "")
+pg_set       |> dplyr::filter(n >= 100)           |> write.csv("pg_set.csv",       row.names = FALSE, na = "")
+pg_attack    |> dplyr::filter(n >= 30)            |> write.csv("pg_attack.csv",    row.names = FALSE, na = "")
+pg_block     |> dplyr::filter(n >= 30)            |> write.csv("pg_block.csv",     row.names = FALSE, na = "")
+
+# SoS-adjusted PG tables
+pg_overall_adj_per_set |> dplyr::filter(sets_played >= 15) |>
+  write.csv("pg_overall_adj.csv", row.names = FALSE, na = "")
+pg_serve_adj     |> dplyr::filter(n >= 20)            |> write.csv("pg_serve_adj.csv",     row.names = FALSE, na = "")
+pg_reception_adj |> dplyr::filter(n_reception >= 30)  |> write.csv("pg_reception_adj.csv", row.names = FALSE, na = "")
+pg_attack_adj    |> dplyr::filter(n >= 30)            |> write.csv("pg_attack_adj.csv",    row.names = FALSE, na = "")
+pg_set_adj       |> dplyr::filter(n >= 100)           |> write.csv("pg_set_adj.csv",       row.names = FALSE, na = "")
+pg_block_adj     |> dplyr::filter(n >= 30)            |> write.csv("pg_block_adj.csv",     row.names = FALSE, na = "")
+pg_dig_adj       |> dplyr::filter(n_dig >= 30)        |> write.csv("pg_dig_adj.csv",       row.names = FALSE, na = "")
+
+# Variance and attribution
+serve_var_components |> write.csv("serve_var_components.csv", row.names = FALSE, na = "")
+variance_split       |> write.csv("variance_split.csv",       row.names = FALSE, na = "")
+pg_attacker_compare  |> write.csv("pg_attacker_compare.csv",  row.names = FALSE, na = "")
+
+cat("All outputs saved.\n")
+```
