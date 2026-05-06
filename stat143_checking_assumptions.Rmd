@@ -1,0 +1,268 @@
+---
+title: "STAT 143: Checking Assumptions"
+output: html_document
+---
+
+# Background
+
+```{r}
+# Clean environment
+rm(list=ls())
+```
+
+```{r}
+# # Install package
+# install.packages(
+#   "datavolley",
+#   repos = c("https://openvolley.r-universe.dev", "https://cloud.r-project.org")
+# )
+```
+
+```{r}
+# Load libraries
+library(tidyverse)
+library(datavolley)
+```
+
+```{r}
+# Load data
+data_dir <- "~/Desktop/stat143project/data"
+
+dvw_files <- list.files(data_dir, pattern = "\\.dvw$", full.names = TRUE)
+
+plays_list <- list()
+
+for (file in dvw_files) {
+  print(file)
+  data <- try(datavolley::dv_read(file, insert_technical_timeouts = FALSE))
+  
+  if ("datavolley" %in% class(data)) {
+    plays_list[[file]] <- datavolley::plays(data)
+  }
+}
+
+plays <- dplyr::bind_rows(plays_list) |>
+  tibble::as_tibble()
+```
+
+```{r}
+# Clean data
+cumpaste <- function(x, .sep = " ") {
+  concat <- paste(x, collapse = .sep)
+  substring(concat, 1L, cumsum(c(nchar(x[[1L]]), nchar(x[-1L]) + nchar(.sep))))
+}
+
+contact <- plays |>
+  mutate(
+    team_id_offense = team_id,
+    team_id_defense = ifelse(team_id_offense == home_team_id, visiting_team_id, home_team_id),
+    serve_receive = ifelse(team == serving_team, "S", "R"),
+    is_volley_end = coalesce(
+      lead(point, 1) | (team_touch_id != lead(team_touch_id, 1)),
+      TRUE
+    ),
+    abbrev = case_when(
+      point ~ "P",
+      is.na(skill) ~ NA_character_,
+      grepl("Unknown", skill) ~ NA_character_,
+      skill == "Serve" ~ "SV",
+      skill == "Attack" ~ paste0("A", attack_code),
+      TRUE ~ paste0(substring(skill, 1, 1), evaluation_code)
+    ),
+    player_id_lead_1 = lead(player_id, 1),
+    skill_lead_1 = lead(skill, 1),
+    evaluation_code_lead_1 = lead(evaluation_code, 1)
+  ) |>
+  filter(!is.na(abbrev), !is.na(serving_team)) |>
+  group_by(match_id, point_id, team_touch_id, point) |>
+  mutate(
+    state = paste0(serve_receive[1], "_", cumpaste(abbrev, .sep = ".")),
+    num_contacts = length(abbrev)
+  ) |>
+  ungroup()
+```
+
+```{r}
+# Construct Markov chain
+bad_data <- contact |>
+  group_by(state) |>
+  mutate(n = n()) |>
+  ungroup() |>
+  filter(
+    (num_contacts > 4) |
+      (abbrev %in% c("SV", "A") & !is_volley_end) |
+      (n < 10)
+  ) |>
+  distinct(match_id, point_id)
+
+state_transition <- contact |>
+  anti_join(bad_data, by = c("match_id", "point_id")) |>
+  count(state, next_state = lead(state, 1)) |>
+  mutate(
+    next_state = case_when(
+      state == "R_P" ~ "R_P",
+      state == "S_P" ~ "S_P",
+      TRUE ~ next_state
+    )
+  )
+
+state_transition_wide <- state_transition |>
+  bind_rows(tibble(state = "S_SV", next_state = "S_SV", n = 0)) |>
+  group_by(state, next_state) |>
+  summarize(n = sum(n), .groups = "drop") |>
+  group_by(state) |>
+  transmute(state, next_state, prob = n / sum(n)) |>
+  arrange(next_state) |>
+  pivot_wider(names_from = next_state, values_from = prob, values_fill = 0) |>
+  arrange(state)
+
+state_transition_matrix <- state_transition_wide |>
+  tibble::column_to_rownames("state") |>
+  as.matrix()
+```
+
+```{r}
+# Get limiting/win probabilities
+state_transition_matrix_limit <- state_transition_matrix
+
+for (i in 1:100) {
+  state_transition_matrix_limit <- state_transition_matrix_limit %*% state_transition_matrix
+}
+
+sideout_prob <- state_transition_matrix_limit[, c("S_P", "R_P")] |>
+  as_tibble() |>
+  add_column(state = rownames(state_transition_matrix), .before = 1) |>
+  transmute(
+    state,
+    sideout_prob = R_P
+  )
+```
+
+# Check Markov Assumption
+
+```{r}
+# Create outcome and contextual variables
+contact_markov <- contact %>% 
+  
+  # Arrange rows in chronological order
+  arrange(match_id, set_number, point_id, file_line_number) %>% 
+  
+  # Define whether team of current row eventually wins the rally
+  mutate(
+    win = as.integer(team == point_won_by)
+  ) %>% 
+  
+  # Work within each rally
+  group_by(match_id, point_id) %>% 
+  mutate(
+    contact_index = row_number(),
+    rally_length = n(),
+    prev_state = lag(state)
+  ) %>% 
+  ungroup()
+
+# Create point number within each set
+point_lookup <- contact_markov %>% 
+  distinct(match_id, set_number, point_id) %>% 
+  arrange(match_id, set_number, point_id) %>% 
+  group_by(match_id, set_number) %>% 
+  mutate(point_index_in_set = row_number()) %>% 
+  ungroup()
+
+# Join point number back onto contact-level data
+contact_markov <- contact_markov %>% 
+  left_join(point_lookup, by = c("match_id", "set_number", "point_id"))
+```
+
+```{r}
+# Keep only states with reasonable sample size
+state_counts <- contact_markov %>% 
+  count(state)
+
+common_states <- state_counts %>% 
+  filter(n >= 30)
+
+df_markov <- contact_markov %>% 
+  semi_join(common_states, by = "state")
+```
+
+```{r}
+# Fit baseline Markov model where outcome depends only on current state
+model_markov <- glm(
+  win ~ factor(state),
+  data = df_markov,
+  family = binomial
+)
+summary(model_markov)
+```
+
+```{r}
+# Fit extended Markov model that allows for history/context
+model_history <- glm(
+  win ~ factor(state) +
+    set_number +
+    point_index_in_set +
+    contact_index,
+  data = df_markov,
+  family = binomial
+)
+summary(model_history)
+```
+
+```{r}
+# Compare the two models
+anova(model_markov, model_history, test = "Chisq")
+```
+
+```{r}
+# Print median rally within a set
+median(df_markov$point_index_in_set, na.rm = TRUE)
+```
+
+
+```{r}
+# Define early vs. late portions of each set
+df_markov <- df_markov %>% 
+  group_by(match_id, set_number) %>% 
+  mutate(
+    early_late = ifelse(
+      point_index_in_set <= median(point_index_in_set, na.rm = TRUE),
+      "Early",
+      "Late"
+    )
+  ) %>% 
+  ungroup()
+
+# Compare win rates for same state across time periods
+state_summary <- df_markov %>% 
+  group_by(state, early_late) %>% 
+  summarize(
+    n = n(),
+    win_rate = mean(win, na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  pivot_wider(
+    names_from = early_late,
+    values_from = c(n, win_rate),
+    values_fill = list(n = 0, win_rate = NA_real_)
+  ) %>% 
+  mutate(
+    diff = win_rate_Late - win_rate_Early
+  ) %>% 
+  arrange(desc(abs(diff)))
+
+state_summary
+```
+
+```{r}
+# Check whether any rallies exceed 100
+rally_summary <- df_markov %>% 
+  distinct(match_id, point_id, rally_length)
+max(rally_summary$rally_length, na.rm = TRUE)
+```
+
+# Summary
+
+After loading and preparing the data, we begin by constructing a Markov chain from our observations (following the PWP model). To assess the Markov assumption within our data, we test whether context/history variables improve prediction after conditioning on the current state. The baseline model regresses (the log-odds of) whether the team won the point on current state alone. The extended model adds `set\_number`, `point\_index\_in\_set`, and `contact\_index`, which represent match progression, set progression, and rally progression, respectively. E.g., controlling for current state, does it matter whether it is the first or last set of the match? If current state is sufficient, these additional variables should not add predictive value. Interestingly, the resulting coefficient estimates for these three predictors are all insignificant when testing $H_0: \beta_j = 0$ ($p > 0.05$). E.g., controlling for all other predictors, there is little evidence that current contact index affects the log-odds of winning the point. Since these two models are nested, we also run a likelihood ratio test to assess whether any of these three additional predictors are noteworthy when testing $H_0: \beta_{\text{set\_number}} = \beta_{\text{point\_index\_in\_set}} = \beta_{\text{contact\_index}} = 0$. Interestingly, the result is insignificant ($p = 0.9066$), so we have little evidence to reject the null hypothesis. Finally, when separating the win rates of different states based on whether the point occurred before or after the median point index within its set, we observe some differences. Specifically, the two largest differences are for the receiving team’s attack states (i.e., R\_R\#.S\#.AX7 and R\_R-.S\#.AX6). However, the vast majority of states have small differences (i.e., $|\Delta| < 0.1$), corroborating the results above.
+
+To justify the use of $P^{100}$ in approximating terminal-state probabilities, we observe within our data no rallies that exceeded a length of 100 (the largest having a length of 51).
